@@ -111,13 +111,54 @@ EOF
 create_hook_script() {
     sep
     log "Vytvářím hook skript '$HOOK_SCRIPT'..."
+
     sudo tee "$HOOK_SCRIPT" >/dev/null <<'EOF'
 #!/bin/bash
 LOG_FILE="/var/log/md-message.log"
-echo "$(date '+%Y-%m-%d %H:%M:%S') Event: $1, Domain: $2" >> "$LOG_FILE"
+
+# Kontrola, zda je skript spuštěn jako root
+if [[ $EUID -ne 0 ]]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Skript musí být spuštěn jako root!" >> "$LOG_FILE"
+    exit 1
+fi
+
+log_event() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+}
+
+log_event "Event: $1, Domain: $2"
+
+case "$1" in
+    "renewing")
+        log_event "[INFO] Obnovuji certifikát pro: $2"
+
+        if ! sudo iptables -C INPUT -p tcp --dport 80 -m comment --comment "ACME renewal" -j ACCEPT 2>/dev/null; then
+            sudo iptables -A INPUT -p tcp --dport 80 -m comment --comment "ACME renewal" -j ACCEPT
+        fi
+        ;;
+    "renewed")
+        log_event "[INFO] Obnova certifikátu byla úspěšná: $2"
+
+        sudo iptables -D INPUT -p tcp --dport 80 -m comment --comment "ACME renewal" -j ACCEPT 2>/dev/null || true
+        ;;
+    "errored")
+        log_event "[ERROR] Chyba při obnově certifikátu pro: $2"
+        ;;
+    "expiring")
+        log_event "[WARNING] Certifikát brzy vyprší: $2"
+        ;;
+    "installed")
+        log_event "[INFO] Certifikát nainstalován: $2"
+        ;;
+    *)
+        log_event "[WARNING] Neznámá událost: $1 pro doménu $2"
+        ;;
+esac
 EOF
+
     sudo chmod +x "$HOOK_SCRIPT"
-    log "Hook skript '$HOOK_SCRIPT' byl vytvořen."
+    sudo chown root:root "$HOOK_SCRIPT"
+    log "Hook skript '$HOOK_SCRIPT' byl vytvořen a nastaven jako spustitelný."
 }
 
 enable_md_config() {
@@ -126,6 +167,24 @@ enable_md_config() {
     A2ENCONF_OUT=$(sudo a2enconf "$(basename "$MOD_MD_CONF")")
     echo "$A2ENCONF_OUT"
     parse_apache_enable_output "$A2ENCONF_OUT"
+}
+
+create_sudoers_file() {
+    sep
+    log "Konfiguruji sudoers soubor pro iptables..."
+
+    SUDOERS_FILE="/etc/sudoers.d/mod_md_iptables"
+
+    sudo tee "$SUDOERS_FILE" >/dev/null <<EOF
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/iptables -I INPUT -p tcp --dport 80 -j ACCEPT *
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/iptables -D INPUT -p tcp --dport 80 -j ACCEPT *
+www-data ALL=(ALL) NOPASSWD: /usr/sbin/iptables -C INPUT -p tcp --dport 80 -j ACCEPT *
+EOF
+
+    sudo chmod 440 "$SUDOERS_FILE"
+    sudo chown root:root "$SUDOERS_FILE"
+
+    log "Sudoers soubor '$SUDOERS_FILE' byl vytvořen s bezpečnými oprávněními."
 }
 
 check_ssl_directives() {
@@ -161,21 +220,47 @@ check_ssl_engine() {
 test_and_reload_apache() {
     sep
     log "Testuji syntaxi Apache..."
+
     if ! $APACHECTL -t; then
-        log "Chyba: Syntaxe Apache není v pořádku."
+        log "[ERROR] Syntaxe Apache není v pořádku. Opravte konfiguraci a zkuste znovu."
         exit 1
     fi
-    log "Syntax OK."
+    log "[OK] Syntaxe Apache je v pořádku."
 
-    if [[ "$RECOMMENDED_ACTION" == "restart" ]]; then
-        log "Provádím restart Apache..."
-        sudo systemctl restart apache2
-    else
-        log "Provádím reload Apache..."
-        sudo systemctl reload apache2
-    fi
-    log "Apache úspěšně restartován/reloadován."
+    case "$RECOMMENDED_ACTION" in
+        restart)
+            log "Doporučená akce: restart Apache..."
+            if sudo systemctl restart apache2; then
+                log "[SUCCESS] Apache byl úspěšně restartován."
+            else
+                log "[ERROR] Apache se nepodařilo restartovat! Zkontrolujte chyby v konfiguraci."
+                log "[HELP] Spusťte manuálně 'journalctl -xe' nebo 'systemctl status apache2' pro detaily."
+                exit 1
+            fi
+            ;;
+        reload)
+            log "Doporučená akce: reload Apache..."
+            if sudo systemctl reload apache2; then
+                log "[SUCCESS] Apache byl úspěšně reloadován."
+            else
+                log "[ERROR] Apache se nepodařilo reloadovat! Zkontrolujte chyby v konfiguraci."
+                log "[HELP] Spusťte manuálně 'journalctl -xe' nebo 'systemctl status apache2' pro detaily."
+                exit 1
+            fi
+            ;;
+        *)
+            log "[WARNING] Neznámá akce '$RECOMMENDED_ACTION'. Provedu bezpečný reload."
+            if sudo systemctl reload apache2; then
+                log "[SUCCESS] Apache byl úspěšně reloadován."
+            else
+                log "[ERROR] Apache se nepodařilo reloadovat! Zkontrolujte chyby v konfiguraci."
+                log "[HELP] Spusťte manuálně 'journalctl -xe' nebo 'systemctl status apache2' pro detaily."
+                exit 1
+            fi
+            ;;
+    esac
 }
+
 
 install_apache
 cleanup_old_config
@@ -184,6 +269,7 @@ enable_modules
 find_domains
 generate_md_config
 create_hook_script
+create_sudoers_file
 enable_md_config
 check_ssl_directives
 check_ssl_engine
